@@ -5,8 +5,16 @@ Reads a CSV file, groups rows by specified row fields, and pivots data on one or
 column fields, counting occurrences per group. Supports special "uptime" pivot
 column to bucket pods by their age based on a starttime epoch.
 
-Usage example:
+Usage examples:
+
+Default pivot (uptime in columns):
     python pivot_tool.py -i pods.csv -o pivot.csv --rows namespace podname --columns uptime region
+
+Uptime as row field:
+    python pivot_tool.py -i pods.csv -o flat.csv --rows namespace podname --uptime-as-row
+
+Uptime count only (no grouping rows):
+    python pivot_tool.py -i pods.csv -o counts.csv --uptime-as-row
 
 Author: Your Name
 """
@@ -16,17 +24,12 @@ import argparse
 from datetime import datetime
 from collections import defaultdict
 
+__version__ = "1.0.1"
+
 
 def classify_pod_age(start_epoch, current_time):
     """
     Classify pod uptime into defined buckets based on starttime epoch.
-
-    Args:
-        start_epoch (str or float): Pod start time in epoch seconds.
-        current_time (datetime): Current UTC datetime.
-
-    Returns:
-        str: Uptime bucket label or "invalid" if timestamp invalid.
     """
     try:
         start_time = datetime.utcfromtimestamp(float(start_epoch))
@@ -38,29 +41,21 @@ def classify_pod_age(start_epoch, current_time):
 
     if days > 730:
         return ">2 years"
-    if 365 <= days <= 730:
+    elif 365 <= days <= 730:
         return "1-2 years"
-    if 180 <= days < 365:
+    elif 180 <= days < 365:
         return "6-12 months"
-    if 90 <= days < 180:
+    elif 90 <= days < 180:
         return "3-6 months"
-    if 0 <= days < 90:
+    elif 0 <= days < 90:
         return "0-3 months"
-    return "invalid"
+    else:
+        return "invalid"
 
 
 def pivot_data(input_file, output_file, row_fields, column_fields, include_invalid):
     """
-    Reads input CSV and pivots data based on given row fields and one or more column fields.
-    If any column_field == 'uptime', calculates uptime buckets based on 'starttime' epoch.
-    Counts occurrences and writes pivot table to output CSV.
-
-    Args:
-        input_file (str): Path to input CSV file.
-        output_file (str): Path to output CSV file.
-        row_fields (list[str]): List of field names to use as row keys.
-        column_fields (list[str]): List of field names to pivot as columns ('uptime' supported).
-        include_invalid (bool): Whether to include invalid/future starttime pods.
+    Pivot data with uptime or other fields as columns.
     """
     now = datetime.utcnow()
     data = defaultdict(lambda: defaultdict(int))
@@ -68,6 +63,7 @@ def pivot_data(input_file, output_file, row_fields, column_fields, include_inval
 
     with open(input_file, "r", encoding="utf-8") as infile:
         reader = csv.DictReader(infile)
+
         for row_num, row in enumerate(reader, 1):
             col_vals = []
             skip_row = False
@@ -83,9 +79,6 @@ def pivot_data(input_file, output_file, row_fields, column_fields, include_inval
                             col_val = None
                 else:
                     col_val = row.get(col_field)
-                    if col_val is None:
-                        # Explicitly None, skip row
-                        col_val = None
 
                 if col_val is None:
                     skip_row = True
@@ -110,16 +103,11 @@ def pivot_data(input_file, output_file, row_fields, column_fields, include_inval
     unique_columns = sorted(unique_columns)
 
     def format_col_key(key):
-        """Format column key tuple into a string with '|' delimiter."""
-        if isinstance(key, tuple):
-            return "|".join(key)
-        return key
+        return "|".join(key) if isinstance(key, tuple) else key
 
     with open(output_file, "w", newline="", encoding="utf-8") as outfile:
         writer = csv.writer(outfile)
-        header = list(row_fields) + [format_col_key(c) for c in unique_columns]
-        writer.writerow(header)
-
+        writer.writerow(list(row_fields) + [format_col_key(c) for c in unique_columns])
         for row_key, counts in sorted(data.items()):
             row = list(row_key)
             for col in unique_columns:
@@ -127,36 +115,66 @@ def pivot_data(input_file, output_file, row_fields, column_fields, include_inval
             writer.writerow(row)
 
 
+def flatten_data(input_file, output_file, row_fields, include_invalid):
+    """
+    Outputs a flattened CSV with uptime as a row field, aggregating counts.
+    If no row_fields specified, counts only uptime buckets.
+    """
+    now = datetime.utcnow()
+    summary = defaultdict(int)
+
+    with open(input_file, "r", encoding="utf-8") as infile:
+        reader = csv.DictReader(infile)
+
+        if "starttime" not in reader.fieldnames:
+            print("Error: 'starttime' column missing from input CSV.")
+            return
+
+        for row_num, row in enumerate(reader, 1):
+            try:
+                row_key = [row[field] for field in row_fields] if row_fields else []
+            except KeyError as e:
+                print(f"Warning: Missing field {e} at row {row_num}. Skipping row.")
+                continue
+
+            start_epoch = row.get("starttime")
+            if not start_epoch:
+                uptime = "invalid" if include_invalid else None
+            else:
+                uptime = classify_pod_age(start_epoch, now)
+                if uptime == "invalid" and not include_invalid:
+                    uptime = None
+
+            if uptime is None:
+                continue
+
+            full_key = tuple(row_key + [uptime])
+            summary[full_key] += 1
+
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow((row_fields if row_fields else []) + ["uptime", "count"])
+        for key, count in sorted(summary.items()):
+            writer.writerow(list(key) + [count])
+
+
 def main():
     """
-    Parse CLI arguments and run the pivot operation or dry-run to show fields.
+    Parse CLI arguments and run the pivot or flatten operation.
     """
     parser = argparse.ArgumentParser(
         description="Flexible pivot tool for pod uptime or other CSV fields"
     )
-    parser.add_argument(
-        "-i", "--input", required=True, help="Input CSV file path"
-    )
-    parser.add_argument(
-        "-o", "--output", required=False,
-        help="Output CSV file path (required unless --dry-run)"
-    )
+    parser.add_argument("-i", "--input", required=True, help="Input CSV file path")
+    parser.add_argument("-o", "--output", required=False, help="Output CSV file path (unless --dry-run)")
     parser.add_argument(
         "--rows", nargs="+", required=False,
-        help="Fields to use as row keys (space-separated)"
+        help="Fields to use as row keys (required unless --uptime-as-row with no grouping)"
     )
-    parser.add_argument(
-        "--columns", nargs="+", required=False,
-        help="Field(s) to pivot as columns (use 'uptime' for uptime buckets, multiple allowed)"
-    )
-    parser.add_argument(
-        "--include-invalid", action="store_true",
-        help="Include invalid/future starttimes in uptime"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Print available CSV fields and exit"
-    )
+    parser.add_argument("--columns", nargs="+", required=False, help="Fields to pivot as columns (e.g., uptime, region)")
+    parser.add_argument("--include-invalid", action="store_true", help="Include invalid/future starttimes in uptime")
+    parser.add_argument("--dry-run", action="store_true", help="Print available CSV fields and exit")
+    parser.add_argument("--uptime-as-row", action="store_true", help="Use uptime as a row field instead of column")
 
     args = parser.parse_args()
 
@@ -170,20 +188,30 @@ def main():
         return
 
     if not args.output:
-        parser.error("the following arguments are required: -o/--output (unless --dry-run)")
+        parser.error("Missing required argument: -o/--output (unless using --dry-run)")
 
-    if not args.rows or not args.columns:
-        parser.error("the following arguments are required: --rows and --columns (unless --dry-run)")
+    if not args.rows and not args.uptime_as_row:
+        parser.error("Missing required argument: --rows (unless using --uptime-as-row)")
 
-    pivot_data(
-        input_file=args.input,
-        output_file=args.output,
-        row_fields=args.rows,
-        column_fields=args.columns,
-        include_invalid=args.include_invalid,
-    )
+    if args.uptime_as_row:
+        flatten_data(
+            input_file=args.input,
+            output_file=args.output,
+            row_fields=args.rows,
+            include_invalid=args.include_invalid,
+        )
+    else:
+        if not args.columns:
+            parser.error("Missing required argument: --columns (unless using --uptime-as-row)")
+        pivot_data(
+            input_file=args.input,
+            output_file=args.output,
+            row_fields=args.rows,
+            column_fields=args.columns,
+            include_invalid=args.include_invalid,
+        )
 
-    print(f"Pivot complete. Output saved to '{args.output}'")
+    print(f"Output saved to '{args.output}'")
 
 
 if __name__ == "__main__":
