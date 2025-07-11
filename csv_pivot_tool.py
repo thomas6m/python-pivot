@@ -72,101 +72,96 @@ def pivot_data_with_duckdb(input_file, output_file, row_fields, column_fields):
     Raises:
         SystemExit: If database or file operations fail.
     """
-    con = None
     try:
-        # Connect to an in-memory DuckDB instance
-        con = duckdb.connect()
+        with duckdb.connect() as con:
+            # Create a DuckDB view for the CSV data
+            con.execute(f"CREATE VIEW data AS SELECT * FROM read_csv_auto('{input_file}')")
 
-        # Create a DuckDB view for the CSV data
-        con.execute(f"CREATE VIEW data AS SELECT * FROM read_csv_auto('{input_file}')")
+            # Quote row fields for SQL safety
+            quoted_row_fields = [quote_identifier(f) for f in row_fields]
 
-        # Quote row fields for SQL safety
-        quoted_row_fields = [quote_identifier(f) for f in row_fields]
+            if column_fields:
+                # Quote column fields for SQL safety
+                quoted_column_fields = [quote_identifier(f) for f in column_fields]
 
-        if column_fields:
-            # Quote column fields for SQL safety
-            quoted_column_fields = [quote_identifier(f) for f in column_fields]
+                # Concatenate column fields for pivot key using safe SQL concatenation
+                if len(quoted_column_fields) > 1:
+                    col_concat = " || '|' || ".join(quoted_column_fields)
+                else:
+                    col_concat = quoted_column_fields[0]
 
-            # Concatenate column fields for pivot key using safe SQL concatenation
-            if len(quoted_column_fields) > 1:
-                col_concat = " || '|' || ".join(quoted_column_fields)
+                # Build WHERE clauses to exclude NULLs safely
+                col_not_null = [f"{f} IS NOT NULL" for f in quoted_column_fields]
+                row_not_null = [f"{f} IS NOT NULL" for f in quoted_row_fields]
+
+                # Query distinct pivot column values
+                distinct_cols_query = f"""
+                    SELECT DISTINCT {col_concat} AS col_key
+                    FROM data
+                    WHERE {" AND ".join(col_not_null)}
+                    ORDER BY col_key
+                """
+                distinct_cols = [row[0] for row in con.execute(distinct_cols_query).fetchall()]
+
+                if not distinct_cols:
+                    logging.warning("No distinct columns found to pivot on.")
+                    return
+
+                # Build CASE statements for pivot aggregation
+                case_statements = []
+                for col_val in distinct_cols:
+                    safe_val = escape_literal(col_val)
+                    case = (
+                        f"SUM(CASE WHEN ({col_concat}) = '{safe_val}' THEN 1 ELSE 0 END) "
+                        f"AS {quote_identifier(col_val)}"
+                    )
+                    case_statements.append(case)
+
+                pivot_query = f"""
+                    SELECT
+                        {', '.join(quoted_row_fields)},
+                        {', '.join(case_statements)}
+                    FROM data
+                    WHERE {" AND ".join(row_not_null)}
+                    GROUP BY {', '.join(quoted_row_fields)}
+                    ORDER BY {', '.join(quoted_row_fields)}
+                """
+
+                result = con.execute(pivot_query).fetchall()
+                columns = [desc[0] for desc in con.description]
+
             else:
-                col_concat = quoted_column_fields[0]
+                # Group by row fields and count occurrences when no columns pivot
+                row_not_null = [f"{f} IS NOT NULL" for f in quoted_row_fields]
 
-            # Build WHERE clauses to exclude NULLs safely
-            col_not_null = [f"{f} IS NOT NULL" for f in quoted_column_fields]
-            row_not_null = [f"{f} IS NOT NULL" for f in quoted_row_fields]
+                pivot_query = f"""
+                    SELECT
+                        {', '.join(quoted_row_fields)},
+                        COUNT(*) AS count
+                    FROM data
+                    WHERE {" AND ".join(row_not_null)}
+                    GROUP BY {', '.join(quoted_row_fields)}
+                    ORDER BY {', '.join(quoted_row_fields)}
+                """
 
-            # Query distinct pivot column values
-            distinct_cols_query = f"""
-                SELECT DISTINCT {col_concat} AS col_key
-                FROM data
-                WHERE {" AND ".join(col_not_null)}
-                ORDER BY col_key
-            """
-            distinct_cols = [row[0] for row in con.execute(distinct_cols_query).fetchall()]
+                result = con.execute(pivot_query).fetchall()
+                columns = [desc[0] for desc in con.description]
 
-            if not distinct_cols:
-                logging.warning("No distinct columns found to pivot on.")
-                return
+            # Write results to output CSV file
+            try:
+                with open(output_file, "w", encoding="utf-8", newline="") as outfile:
+                    writer = csv.writer(outfile)
+                    writer.writerow(columns)
+                    writer.writerows(result)
+            except IOError as e:
+                logging.error(f"Error writing output file: {e}")
+                sys.exit(1)
 
-            # Build CASE statements for pivot aggregation
-            case_statements = []
-            for col_val in distinct_cols:
-                safe_val = escape_literal(col_val)
-                case = (
-                    f"SUM(CASE WHEN ({col_concat}) = '{safe_val}' THEN 1 ELSE 0 END) "
-                    f"AS {quote_identifier(col_val)}"
-                )
-                case_statements.append(case)
-
-            pivot_query = f"""
-                SELECT
-                    {', '.join(quoted_row_fields)},
-                    {', '.join(case_statements)}
-                FROM data
-                WHERE {" AND ".join(row_not_null)}
-                GROUP BY {', '.join(quoted_row_fields)}
-                ORDER BY {', '.join(quoted_row_fields)}
-            """
-
-            result = con.execute(pivot_query).fetchall()
-            columns = [desc[0] for desc in con.description]
-
-        else:
-            # Group by row fields and count occurrences when no columns pivot
-            row_not_null = [f"{f} IS NOT NULL" for f in quoted_row_fields]
-
-            pivot_query = f"""
-                SELECT
-                    {', '.join(quoted_row_fields)},
-                    COUNT(*) AS count
-                FROM data
-                WHERE {" AND ".join(row_not_null)}
-                GROUP BY {', '.join(quoted_row_fields)}
-                ORDER BY {', '.join(quoted_row_fields)}
-            """
-
-            result = con.execute(pivot_query).fetchall()
-            columns = [desc[0] for desc in con.description]
-
-        # Write results to output CSV file
-        try:
-            with open(output_file, "w", encoding="utf-8", newline="") as outfile:
-                writer = csv.writer(outfile)
-                writer.writerow(columns)
-                writer.writerows(result)
-        except IOError as e:
-            logging.error(f"Error writing output file: {e}")
-            sys.exit(1)
+            logging.info(f"Pivot table successfully created and saved to '{output_file}'")
 
     except (duckdb.Error, Exception) as e:
         logging.error(f"Database query error: {e}")
         sys.exit(1)
-
-    finally:
-        if con:
-            con.close()
 
 
 def main():
